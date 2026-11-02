@@ -1,8 +1,22 @@
 'use strict';
 // Cara de caca - servidor online (sin dependencias: solo Node.js 18+)
 const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto'),vm=require('vm');
-const PORT=process.env.PORT||3000;
+const PORT=process.env.PORT||3000,AFK_MS=+process.env.AFK_MS||45000,DEAD_MS=+process.env.DEAD_MS||45000,PING_MS=+process.env.PING_MS||15000;
 const ENGINE=fs.readFileSync(path.join(__dirname,'engine.js'),'utf8');
+const DATA=process.env.DATA_DIR||path.join(__dirname,'data'),UF=path.join(DATA,'users.json');
+let users={};try{users=JSON.parse(fs.readFileSync(UF,'utf8'))}catch(e){}
+function saveUsers(){try{fs.mkdirSync(DATA,{recursive:true});const t=UF+'.tmp';fs.writeFileSync(t,JSON.stringify(users));fs.renameSync(t,UF)}catch(e){console.error('No se pudo guardar usuarios:',e.message)}}
+const hashPin=(pin,salt)=>crypto.scryptSync(pin,salt,32).toString('hex');
+function login(name,pin){
+  const key=name.toLowerCase();pin=String(pin||'').trim();
+  if(!pin)return users[key]?{err:'Ese nombre tiene cuenta: escribe su PIN'}:{guest:true};
+  if(!/^[A-Za-z0-9]{4,12}$/.test(pin))return{err:'El PIN debe tener de 4 a 12 letras o números'};
+  const u=users[key];
+  if(!u){const salt=crypto.randomBytes(8).toString('hex');users[key]={name,salt,h:hashPin(pin,salt),g:0,l:0,fails:0,lock:0};saveUsers();return{key}}
+  if(Date.now()<u.lock)return{err:'Demasiados intentos, espera un minuto'};
+  if(hashPin(pin,u.salt)!==u.h){if(++u.fails>=5){u.fails=0;u.lock=Date.now()+60000}return{err:'PIN incorrecto'}}
+  u.fails=0;return{key};
+}
 const GUID='258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
 /* ---------- HTTP ---------- */
@@ -17,8 +31,8 @@ const server=http.createServer((req,res)=>{
 /* ---------- WebSocket mínimo ---------- */
 const conns=new Set();
 class Conn{
-  constructor(s){this.s=s;this.buf=Buffer.alloc(0);this.alive=true;conns.add(this);
-    s.on('data',d=>{this.buf=Buffer.concat([this.buf,d]);this.parse()});
+  constructor(s){this.s=s;this.buf=Buffer.alloc(0);this.alive=true;this.last=Date.now();conns.add(this);
+    s.on('data',d=>{this.last=Date.now();this.buf=Buffer.concat([this.buf,d]);this.parse()});
     s.on('close',()=>this.close());s.on('error',()=>this.close())}
   parse(){
     for(;;){
@@ -53,18 +67,39 @@ server.on('upgrade',(req,sock)=>{
     crypto.createHash('sha1').update(k+GUID).digest('base64')+'\r\n\r\n');
   handle(new Conn(sock));
 });
-setInterval(()=>conns.forEach(c=>c.frame(9,Buffer.alloc(0))),25000);
+setInterval(()=>conns.forEach(c=>{if(Date.now()-c.last>DEAD_MS)c.close();else c.frame(9,Buffer.alloc(0))}),PING_MS);
 
 /* ---------- Salas ---------- */
 const rooms=new Map(),MAXP=6,MINP=3;
 const clean=s=>String(s||'').replace(/[<>&"'`\\]/g,'').trim().slice(0,12)||'Jugador';
 function newCode(){let c;do{c=Array.from({length:4},()=>'ABCDEFGHJKLMNPQRSTUVWXYZ'[Math.random()*24|0]).join('')}while(rooms.has(c));return c}
-function lobbyMsg(r,i){return{t:'lobby',code:r.code,seats:r.seats.map((s,k)=>({n:s.name,bot:s.bot,host:s===r.host})),you:i,host:r.seats[i]===r.host,diff:r.diff}}
+function lobbyMsg(r,i){return{t:'lobby',code:r.code,seats:r.seats.map((s,k)=>({n:s.name,bot:s.bot,host:s===r.host})),you:i,host:r.seats[i]===r.host,diff:r.diff,token:r.seats[i].token,rec:(u=>u?{g:u.g,l:u.l}:null)(r.seats[i].user&&users[r.seats[i].user])}}
 function sendLobby(r){r.seats.forEach((s,i)=>s.c&&s.c.send(lobbyMsg(r,i)))}
-function sync(r){if(!r.ctx||r.dead)return;r.seats.forEach((s,i)=>{if(s.c)s.c.send({t:'state',s:r.ctx.API.snap(i)})})}
+function sync(r){if(!r.ctx||r.dead)return;r.seats.forEach((s,i)=>{if(s.c)s.c.send({t:'state',s:r.ctx.API.snap(i)})});watch(r)}
+function record(r,w){
+  r.seats.forEach((s,i)=>{const u=s.user&&users[s.user];if(!u)return;u.g++;if(i===w.loser)u.l++});
+  saveUsers();
+  r.seats.forEach(s=>{const u=s.user&&users[s.user];if(u&&s.c)s.c.send({t:'rec',g:u.g,l:u.l})});
+}
+function watch(r){
+  const w=r.ctx.API.cur();
+  if(w&&w.over&&w.loser!=null&&!r.recorded){r.recorded=true;record(r,w)}
+  if(!w||w.over||w.cur==null){clearTimeout(r.afk);r.afkKey=null;return}
+  const s=r.seats[w.cur],key=w.cur+':'+w.t;
+  if(!s||!s.c||s.bot){clearTimeout(r.afk);r.afkKey=null;return}
+  if(r.afkKey===key)return;
+  r.afkKey=key;clearTimeout(r.afk);
+  r.afk=setTimeout(()=>{
+    if(r.dead||!r.ctx)return;const w2=r.ctx.API.cur();
+    if(!w2||w2.cur!==w.cur||w2.t!==w.t)return;
+    if((s.strikes=(s.strikes||0)+1)>=2){s.bot=true;s.c&&s.c.send({t:'fx',b:['⏰ Pasas a bot','casi']});r.ctx.API.kick(w.cur)}
+    else r.ctx.API.auto(w.cur);
+  },AFK_MS);
+}
 function startGame(r){
   while(r.seats.length<MINP)r.seats.push({c:null,bot:true,name:'Bot '+(r.seats.filter(s=>s.bot).length+1)});
-  const host={sync:()=>sync(r),fx:o=>r.seats.forEach(s=>s.c&&s.c.send({t:'fx',...o}))};
+  r.recorded=false;
+  const host={sync:()=>sync(r),fx:o=>r.seats.forEach((s,k)=>{if(!s.c)return;let m={t:'fx',...o};if(o.a&&o.a.k==='draw'&&k!==o.a.i)m={t:'fx',a:{k:'draw',i:o.a.i,n:o.a.n}};s.c.send(m)})};
   const ctx=vm.createContext({HOST:host,setTimeout,Math,console});
   vm.runInContext(ENGINE,ctx);r.ctx=ctx;r.started=true;
   ctx.API.newGame(r.seats.map(s=>({name:s.name,bot:s.bot})),r.diff);
@@ -78,7 +113,7 @@ function leave(r,seat){
     sendLobby(r);return;
   }
   seat.bot=true;
-  if(!r.seats.some(s=>s.c)){r.dead=true;r.ctx.API.stop();rooms.delete(r.code);return}
+  if(!r.seats.some(s=>s.c)){r.gc=setTimeout(()=>{r.dead=true;r.ctx&&r.ctx.API.stop();rooms.delete(r.code)},120000);return}
   if(r.host===seat)r.host=r.seats.find(s=>s.c);
   r.ctx.API.kick(i);
 }
@@ -89,14 +124,26 @@ function handle(c){
     const err=t=>c.send({t:'err',m:t});
     if(!r){
       if(m.t==='create'){
+        const L=login(clean(m.name),m.pin);if(L.err)return err(L.err);
         r={code:newCode(),seats:[],diff:'m',started:false,ctx:null,host:null};
-        seat={c,bot:false,name:clean(m.name)};r.seats.push(seat);r.host=seat;rooms.set(r.code,r);sendLobby(r);
+        seat={c,bot:false,name:L.key?users[L.key].name:clean(m.name),user:L.key||null,token:crypto.randomBytes(8).toString('hex')};r.seats.push(seat);r.host=seat;rooms.set(r.code,r);sendLobby(r);
       }else if(m.t==='join'){
         const q=rooms.get(String(m.code||'').toUpperCase());
         if(!q)return err('No existe esa sala');
         if(q.started)return err('La partida ya empezó');
         if(q.seats.length>=MAXP)return err('La sala está llena');
-        r=q;seat={c,bot:false,name:clean(m.name)};r.seats.push(seat);sendLobby(r);
+        const L=login(clean(m.name),m.pin);if(L.err)return err(L.err);
+        const nn=L.key?users[L.key].name:clean(m.name);
+        if(q.seats.some(x=>x.name.toLowerCase()===nn.toLowerCase()))return err('Ese nombre ya está en la sala');
+        r=q;seat={c,bot:false,name:nn,user:L.key||null,token:crypto.randomBytes(8).toString('hex')};r.seats.push(seat);sendLobby(r);
+      }else if(m.t==='board'){
+        c.send({t:'board',list:Object.values(users).filter(u=>u.g>0).map(u=>({n:u.name,g:u.g,l:u.l})).sort((a,b)=>b.l-a.l||b.g-a.g).slice(0,30)});
+      }else if(m.t==='rejoin'){
+        const q=rooms.get(String(m.code||'').toUpperCase()),sx=q&&q.seats.find(x=>x.token&&x.token===m.token);
+        if(!sx)return err('La sala ya no existe');
+        if(sx.c&&sx.c!==c){sx.c.onclose=null;sx.c.close()}
+        clearTimeout(q.gc);r=q;seat=sx;seat.c=c;seat.strikes=0;
+        if(q.started){seat.bot=false;q.ctx.API.unkick(q.seats.indexOf(seat));sync(q)}else sendLobby(q);
       }
       return;
     }
@@ -109,7 +156,9 @@ function handle(c){
       else if(m.t==='start')startGame(r);
       return;
     }
-    const a=r.ctx.API,ids=Array.isArray(m.ids)?m.ids.filter(x=>Number.isInteger(x)).slice(0,30):[];
+    const a=r.ctx.API;
+    if(seat.bot&&seat.c){seat.bot=false;a.unkick(i)}seat.strikes=0;
+    const ids=Array.isArray(m.ids)?m.ids.filter(x=>Number.isInteger(x)).slice(0,30):[];
     switch(m.t){
       case 'play':a.play(i,ids);break;
       case 'zap':a.zap(i,ids);break;

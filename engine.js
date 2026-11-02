@@ -4,9 +4,9 @@ const HOST=globalThis.HOST;
 function render(){HOST.sync()}
 function banner(t,c){HOST.fx({b:[t,c||'']})}
 function snd(n){HOST.fx({s:n})}
-function anim(i,cs,done){done()}
-function animTake(i,done){done()}
-function animDraw(){}
+function anim(i,cs,done){HOST.fx({a:{k:'play',i,cs:cs.map(vis),h:ORG}});ORG=null;done()}
+function animTake(i,done){HOST.fx({a:{k:'take',i}});done()}
+function animDraw(i,cs){if(cs.length)HOST.fx({a:{k:'draw',i,n:cs.length,cv:cs.map(vis)}})}
 const R=['2','3','4','5','6','7','8','9','10','J','Q','K','A'],S=['♠','♥','♦','♣'];
 const nm=c=>c.r==13?'Joker':R[c.r]+c.s;
 const act=p=>p.h.length+p.u.length+p.d.length>0;
@@ -116,7 +116,7 @@ const API={newGame,snap,
   play(i,ids){if(G.over||G.cur!==i)return;const p=P[i],s=phase(p);if(s=='d')return;
     const cs=ids.map(id=>p[s].find(c=>c.id==id));if(!cs.length||cs.some(c=>!c||c.r!=cs[0].r))return;
     if(G.resp)setDir(i);rm(p,s,cs);
-    if(ok(cs[0]))play(i,cs);else{say(`${p.n} juega ${nm(cs[0])}, pero no sirve`);G.pile.push(...cs);take(i)}},
+    if(ok(cs[0]))play(i,cs);else anim(i,cs,()=>{say(`${p.n} juega ${nm(cs[0])}, pero no sirve`);G.pile.push(...cs);take(i)})},
   zap(i,ids){if(!lzOKs(i))return;const p=P[i],s=phase(p),t=tp();
     const cs=ids.map(id=>p[s].find(x=>x.id==id)).filter(c=>c&&c.r==t.r);if(!cs.length)return;doZap(i,cs,s)},
   blind(i){if(G.over||G.cur!==i||phase(P[i])!='h'||!G.deck.length)return;blind(i)},
@@ -125,6 +125,9 @@ const API={newGame,snap,
   cede(i){if(G.cur!==i||!G.resp||G.resp.other==null)return;const j=G.resp.other;setDir(j);G.cur=j;turn()},
   kick(i){P[i].bot=true;if(G.over)return;if(G.resp&&G.cur===i)setDir(i);if(G.cur===i)turn();else render()},
   over(){return !!(G&&G.over)},
+  cur(){return G?{cur:G.cur,t:G.t,over:G.over,loser:G.loser}:null},
+  unkick(i){if(P[i])P[i].bot=false},
+  auto(i){if(G.over||G.cur!==i)return false;say(P[i].n+' tardó mucho: jugada automática');if(G.resp)setDir(i);botMove();return true},
   stop(){if(G){G.over=true;G.t=-1}}
 };
 globalThis.API=API;
